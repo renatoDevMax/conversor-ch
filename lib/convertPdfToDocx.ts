@@ -222,8 +222,11 @@ function extractShapes(mupdf: MupdfModule, page: PDFPage): ShapeRect[] {
       const width = x1 - x0;
       const height = y1 - y0;
       if (width <= 2 || height <= 2) return;
-      const isWhite = fill[0] > 250 && fill[1] > 250 && fill[2] > 250;
-      if (isWhite && width * height > pageArea * 0.8) return;
+      // Pure white fills are invisible on white paper and, in Word, often paint
+      // over the gray table-header / zebra rows because of anchor z-order.
+      const isWhite = fill[0] >= 250 && fill[1] >= 250 && fill[2] >= 250;
+      if (isWhite) return;
+      if (width * height > pageArea * 0.8) return;
       shapes.push({ x0, y0, x1, y1, fill, behind: true });
     },
     strokePath(path: Path, stroke: StrokeState, ctm: Matrix, _cs: unknown, color: number[]) {
@@ -253,7 +256,14 @@ function extractShapes(mupdf: MupdfModule, page: PDFPage): ShapeRect[] {
     },
   } as never);
 
-  page.run(device, mupdf.Matrix.identity);
+  try {
+    page.run(device, mupdf.Matrix.identity);
+    // MuPDF warns ("dropping unclosed device") if close() is skipped before GC/destroy.
+    device.close();
+  } finally {
+    device.destroy();
+    fillStroke.destroy();
+  }
 
   const unique = new Map<string, ShapeRect>();
   for (const shape of shapes) {
@@ -270,7 +280,14 @@ function extractShapes(mupdf: MupdfModule, page: PDFPage): ShapeRect[] {
     ].join("|");
     unique.set(key, shape);
   }
-  return [...unique.values()];
+
+  // Larger fills first (lower Word relativeHeight), then strokes/lines on top.
+  return [...unique.values()].sort((a, b) => {
+    const areaA = Math.abs(a.x1 - a.x0) * Math.abs(a.y1 - a.y0);
+    const areaB = Math.abs(b.x1 - b.x0) * Math.abs(b.y1 - b.y0);
+    if (areaA !== areaB) return areaB - areaA;
+    return a.y0 - b.y0 || a.x0 - b.x0;
+  });
 }
 
 function shapeRectXml(shape: ShapeRect, shapeId: number): string {

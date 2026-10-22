@@ -1,16 +1,14 @@
 "use client";
 
-import { renderAsync } from "docx-preview";
 import { useRef, useState } from "react";
+
+type Status = "idle" | "loading" | "ready" | "error";
 
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
-  const viewerRef = useRef<HTMLDivElement>(null);
   const [fileName, setFileName] = useState<string | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">(
-    "idle",
-  );
+  const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
 
   function handleSelectClick() {
@@ -32,12 +30,7 @@ export default function Home() {
       setDownloadUrl(null);
     }
 
-    if (viewerRef.current) {
-      viewerRef.current.innerHTML = "";
-    }
-
     try {
-      // Conversion runs in the browser (no Python / Vercel serverless Python).
       const { convertPdfToDocx } = await import("@/lib/convertPdfToDocx");
       const pdfBytes = new Uint8Array(await file.arrayBuffer());
       const docxBytes = await convertPdfToDocx(pdfBytes);
@@ -50,19 +43,6 @@ export default function Home() {
         type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       });
       setDownloadUrl(URL.createObjectURL(blob));
-
-      if (!viewerRef.current) {
-        throw new Error("Área de visualização indisponível.");
-      }
-
-      await renderAsync(docxCopy.buffer, viewerRef.current, undefined, {
-        className: "docx",
-        inWrapper: true,
-        breakPages: true,
-        renderHeaders: true,
-        renderFooters: true,
-      });
-
       setStatus("ready");
     } catch (err) {
       setStatus("error");
@@ -73,62 +53,83 @@ export default function Home() {
   }
 
   return (
-    <div className="flex flex-1 flex-col items-center px-6 py-10">
-      <main className="flex w-full max-w-5xl flex-col items-center gap-6">
-        <div className="flex flex-col items-center gap-3 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Converter PDF em Word
-          </h1>
-          <p className="max-w-xl text-sm text-zinc-600 dark:text-zinc-400">
-            Converte o PDF em Word editável com o mesmo layout, já sem os
-            sublinhados dos horários. Use &quot;Baixar Word&quot; para abrir no
-            Microsoft Word.
-          </p>
+    <div className="home-shell relative flex flex-1 flex-col overflow-hidden">
+      <div className="home-aurora" aria-hidden />
+      <div className="home-grid" aria-hidden />
 
-          <input
-            ref={inputRef}
-            type="file"
-            accept="application/pdf,.pdf"
-            className="hidden"
-            onChange={handleFileChange}
-          />
+      <main className="relative z-10 mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center px-6 py-16 text-center">
+        <p className="home-brand">Removedor de Traços RM</p>
+        <h1 className="home-title mt-4">
+          PDF em Word editável,
+          <span className="home-title-accent"> sem os traços</span>
+        </h1>
+        <p className="home-subtitle mt-4 max-w-lg">
+          Selecione o espelho de ponto e baixe o Word com o mesmo layout, pronto
+          para editar.
+        </p>
 
-          <div className="flex flex-wrap items-center justify-center gap-3">
-            <button
-              type="button"
-              onClick={handleSelectClick}
-              disabled={status === "loading"}
-              className="rounded-lg bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-            >
-              {status === "loading" ? "Convertendo..." : "Selecionar PDF"}
-            </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          className="hidden"
+          onChange={handleFileChange}
+        />
 
-            {downloadUrl && fileName && (
-              <a
-                href={downloadUrl}
-                download={fileName}
-                className="rounded-lg border border-zinc-300 px-5 py-2.5 text-sm font-medium text-zinc-900 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-800"
+        {status === "loading" && (
+          <div className="home-loading mt-12" role="status" aria-live="polite">
+            <div className="home-loading-ring" aria-hidden>
+              <span />
+              <span />
+              <span />
+            </div>
+            <p className="home-loading-text">
+              Já estou preparando esse arquivo pra voce
+            </p>
+            {fileName && <p className="home-file-name">{fileName}</p>}
+          </div>
+        )}
+
+        {status !== "loading" && (
+          <div className="mt-12 flex w-full flex-col items-center gap-4">
+            {status === "ready" && downloadUrl && fileName ? (
+              <>
+                <p className="home-ready-label">Pronto para baixar</p>
+                <p className="home-file-name">{fileName}</p>
+                <div className="flex flex-wrap items-center justify-center gap-4">
+                  <a
+                    href={downloadUrl}
+                    download={fileName}
+                    className="neon-btn neon-btn-primary"
+                  >
+                    Baixar Word
+                  </a>
+                  <button
+                    type="button"
+                    onClick={handleSelectClick}
+                    className="neon-btn neon-btn-ghost"
+                  >
+                    Selecionar outro
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSelectClick}
+                className="neon-btn neon-btn-primary"
               >
-                Baixar Word
-              </a>
+                Selecionar PDF
+              </button>
+            )}
+
+            {error && (
+              <p className="home-error" role="alert">
+                {error}
+              </p>
             )}
           </div>
-
-          {fileName && (
-            <p className="text-sm text-zinc-700 dark:text-zinc-300">
-              {status === "ready" ? "Documento Word: " : "Arquivo: "}
-              <span className="font-medium">{fileName}</span>
-            </p>
-          )}
-
-          {error && <p className="text-sm text-red-600">{error}</p>}
-        </div>
-
-        <div
-          ref={viewerRef}
-          className="docx-viewer w-full overflow-auto rounded-lg border border-zinc-200 bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900"
-          aria-live="polite"
-        />
+        )}
       </main>
     </div>
   );
