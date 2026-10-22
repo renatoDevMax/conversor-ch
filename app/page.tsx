@@ -58,14 +58,14 @@ export default function Home() {
       <div className="home-grid" aria-hidden />
 
       <main className="relative z-10 mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center px-6 py-16 text-center">
-        <p className="home-brand">Removedor de Traços RM</p>
+        <p className="home-brand">Conversor de PDF RM</p>
         <h1 className="home-title mt-4">
-          PDF em Word editável,
-          <span className="home-title-accent"> sem os traços</span>
+          Converta seu PDF em
+          <span className="home-title-accent"> Word editável</span>
         </h1>
         <p className="home-subtitle mt-4 max-w-lg">
-          Selecione o espelho de ponto e baixe o Word com o mesmo layout, pronto
-          para editar.
+          Selecione o arquivo PDF e baixe o Word com o mesmo layout, pronto para
+          editar.
         </p>
 
         <input

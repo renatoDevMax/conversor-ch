@@ -15,8 +15,8 @@ const exo2 = Exo_2({
 });
 
 export const metadata: Metadata = {
-  title: "Removedor de Traços RM",
-  description: "Converta PDF em Word editável sem os traços dos horários",
+  title: "Conversor de PDF RM",
+  description: "Converta PDF em Word editável com o mesmo layout",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
