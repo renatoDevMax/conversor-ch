@@ -1,0 +1,15 @@
+import { copyFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const src = join(root, "node_modules", "mupdf", "dist");
+const dest = join(root, "public", "mupdf");
+
+mkdirSync(dest, { recursive: true });
+
+for (const name of ["mupdf.js", "mupdf-wasm.js", "mupdf-wasm.wasm"]) {
+  copyFileSync(join(src, name), join(dest, name));
+}
+
+console.log("Copied MuPDF assets to public/mupdf");

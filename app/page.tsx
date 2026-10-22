@@ -37,30 +37,16 @@ export default function Home() {
     }
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const response = await fetch("/api/convert", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const data = (await response.json().catch(() => null)) as {
-          error?: string;
-        } | null;
-        throw new Error(data?.error ?? "Falha ao converter o PDF.");
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const convertedName =
-        decodeURIComponent(
-          response.headers.get("X-Converted-Filename") ?? "",
-        ) || file.name.replace(/\.pdf$/i, "") + ".docx";
+      // Conversion runs in the browser (no Python / Vercel serverless Python).
+      const { convertPdfToDocx } = await import("@/lib/convertPdfToDocx");
+      const pdfBytes = new Uint8Array(await file.arrayBuffer());
+      const docxBytes = await convertPdfToDocx(pdfBytes);
+      const convertedName = file.name.replace(/\.pdf$/i, "") + ".docx";
 
       setFileName(convertedName);
 
-      const blob = new Blob([arrayBuffer], {
+      const docxCopy = new Uint8Array(docxBytes);
+      const blob = new Blob([docxCopy], {
         type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       });
       setDownloadUrl(URL.createObjectURL(blob));
@@ -69,7 +55,7 @@ export default function Home() {
         throw new Error("Área de visualização indisponível.");
       }
 
-      await renderAsync(arrayBuffer, viewerRef.current, undefined, {
+      await renderAsync(docxCopy.buffer, viewerRef.current, undefined, {
         className: "docx",
         inWrapper: true,
         breakPages: true,

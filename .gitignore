@@ -20,6 +20,9 @@
 # production
 /build
 
+# MuPDF WASM copied from node_modules on postinstall / build
+/public/mupdf/
+
 # misc
 .DS_Store
 *.pem
