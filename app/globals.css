@@ -24,3 +24,18 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+.docx-viewer {
+  min-height: 70vh;
+}
+
+.docx-viewer .docx-wrapper {
+  background: #e5e5e5;
+  padding: 24px 0;
+}
+
+.docx-viewer .docx-wrapper > section.docx {
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  margin-bottom: 24px;
+}

@@ -23,6 +23,12 @@
 # misc
 .DS_Store
 *.pem
+testepdf-converted.docx
+testepdf-abs.docx
+testepdf-page-*.png
+testepdf-*-page-*.png
+testepdf-crop-*.png
+testepdf-debug-*.png
 
 # debug
 npm-debug.log*
