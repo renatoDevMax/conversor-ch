@@ -16,7 +16,7 @@ const exo2 = Exo_2({
 
 export const metadata: Metadata = {
   title: "Conversor de PDF RM",
-  description: "Converta PDF em Word editável com o mesmo layout",
+  description: "Converta PDF em Word com a tabela do espelho de ponto",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

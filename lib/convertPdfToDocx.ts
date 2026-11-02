@@ -1,45 +1,61 @@
 import JSZip from "jszip";
-import type { Font, Matrix, Path, PDFPage, StrokeState } from "mupdf";
-import { loadMupdf, type MupdfModule } from "@/lib/loadMupdf";
+import type { PDFPage } from "mupdf";
+import { loadMupdf } from "@/lib/loadMupdf";
 
-const EMU_PER_PT = 12700;
-
-const TIME_UNDERLINE_MIN_LEN = 5;
-const TIME_UNDERLINE_MAX_LEN = 45;
-const TIME_UNDERLINE_MAX_THICKNESS = 2;
-const ATTACH_MARKERS = new Set(["²", "³", "°", "º", "*", "†"]);
-const TIME_TOKEN_RE = /\d{1,3}:\d{2}/;
+const ROW_BAND = 4;
+const PAGE_MARGIN = 28;
+const SIGN_X = 321.5;
+const SIGN_WIDTH = 246;
+const PAGE_RIGHT = 26;
+const PAGE_TOP = 28;
+const TICK_X = 140;
+const RIGHT_COL_X = 450;
+const TITLE_ROW = 14;
+const SUB_ROW = 14;
+const BAR_ROW = 7;
+const BODY_TOP = PAGE_TOP + TITLE_ROW + SUB_ROW + BAR_ROW;
 
 type RGB = [number, number, number];
 
-type TextSpan = {
-  text: string;
+type Glyph = {
+  c: string;
   x0: number;
-  y0: number;
   x1: number;
-  y1: number;
+  y0: number;
+  baseline: number;
   size: number;
   bold: boolean;
   color: RGB;
 };
 
-type ShapeRect = {
+type RichCell = {
   x0: number;
-  y0: number;
   x1: number;
-  y1: number;
-  fill?: RGB | null;
-  stroke?: RGB | null;
-  strokeWidth?: number;
-  behind?: boolean;
+  glyphs: Glyph[];
 };
 
-function ptEmu(value: number): number {
-  return Math.round(value * EMU_PER_PT);
+type VisualLine = {
+  y: number;
+  cells: RichCell[];
+};
+
+type TextRun = {
+  text: string;
+  size: number;
+  bold: boolean;
+  color: RGB;
+  baseline: number;
+};
+
+function tw(points: number): number {
+  return Math.round(points * 20);
 }
 
 function rgbHex(color: RGB): string {
-  return color.map((c) => Math.max(0, Math.min(255, c)).toString(16).padStart(2, "0")).join("").toUpperCase();
+  return color
+    .map((channel) => Math.max(0, Math.min(255, channel)).toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase();
 }
 
 function escapeXml(text: string): string {
@@ -51,309 +67,566 @@ function escapeXml(text: string): string {
     .replaceAll("'", "&apos;");
 }
 
-function isTimeUnderline(x0: number, y0: number, x1: number, y1: number): boolean {
-  const width = Math.abs(x1 - x0);
-  const height = Math.abs(y1 - y0);
-  return height <= TIME_UNDERLINE_MAX_THICKNESS && width > TIME_UNDERLINE_MIN_LEN && width < TIME_UNDERLINE_MAX_LEN;
+function cleanText(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
 }
 
-function isPointArtifact(x0: number, y0: number, x1: number, y1: number): boolean {
-  return Math.abs(x1 - x0) <= 1.5 && Math.abs(y1 - y0) <= TIME_UNDERLINE_MAX_THICKNESS;
-}
-
-function toRgb(color: number[] | undefined | null): RGB | null {
-  if (!color || color.length < 3) return null;
-  const [r, g, b] = color;
-  if (Math.max(r, g, b) <= 1) {
-    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+function toRgb(color: ArrayLike<number> | undefined | null): RGB | null {
+  if (!color || color.length === 0) return null;
+  const scale = Math.max(...Array.from(color)) <= 1;
+  const channel = (value: number) => Math.round(scale ? value * 255 : value);
+  if (color.length === 1) {
+    const gray = channel(color[0]);
+    return [gray, gray, gray];
   }
-  return [Math.round(r), Math.round(g), Math.round(b)];
+  if (color.length < 3) return null;
+  return [channel(color[0]), channel(color[1]), channel(color[2])];
 }
 
-function extractSpans(page: PDFPage): TextSpan[] {
-  const stext = page.toStructuredText("preserve-spans");
-  type CharRun = {
-    c: string;
-    x0: number;
-    y0: number;
-    x1: number;
-    y1: number;
-    size: number;
-    bold: boolean;
-    color: RGB;
+function cellText(cell: RichCell): string {
+  return cell.glyphs
+    .map((glyph) => glyph.c)
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function lineText(line: VisualLine): string {
+  return line.cells.map(cellText).join(" ");
+}
+
+function yOf(cell: RichCell): number {
+  return Math.min(...cell.glyphs.map((glyph) => glyph.y0));
+}
+
+function regroup(lines: VisualLine[], band: number): VisualLine[] {
+  const sorted = lines
+    .flatMap((line) => line.cells)
+    .sort((a, b) => yOf(a) - yOf(b) || a.x0 - b.x0);
+  const rows: VisualLine[] = [];
+
+  for (const cell of sorted) {
+    const y = yOf(cell);
+    const row = rows.at(-1);
+    if (row && y - row.y <= band) {
+      row.cells.push(cell);
+      continue;
+    }
+    rows.push({ y, cells: [cell] });
+  }
+
+  for (const row of rows) row.cells.sort((a, b) => a.x0 - b.x0);
+  return rows;
+}
+
+function cellFromSpan(glyphs: Glyph[]): RichCell | null {
+  const ordered = [...glyphs].sort((a, b) => a.x0 - b.x0);
+  const compact: Glyph[] = [];
+  for (const glyph of ordered) {
+    const prev = compact.at(-1);
+    // QuickReports paints the same glyph twice. The second copy overlaps the first.
+    if (prev && glyph.x0 < prev.x1 - 0.5) continue;
+    compact.push(glyph);
+  }
+
+  while (compact.length > 0 && !compact[0].c.trim()) compact.shift();
+  while (compact.length > 0 && !compact.at(-1)!.c.trim()) compact.pop();
+  if (compact.length === 0) return null;
+
+  return {
+    x0: Math.min(...compact.map((glyph) => glyph.x0)),
+    x1: Math.max(...compact.map((glyph) => glyph.x1)),
+    glyphs: compact,
   };
-
-  const chars: CharRun[] = [];
-
-  stext.walk({
-    onChar(c: string, _origin: number[], font: Font, size: number, a: number[], b: number[]) {
-      if (!c || !c.trim()) return;
-
-      const quad = a.length === 8 ? a : b;
-      const colorArr = b.length === 3 ? b : a.length === 3 ? a : [0, 0, 0];
-      if (quad.length < 8) return;
-
-      const xs = [quad[0], quad[2], quad[4], quad[6]];
-      const ys = [quad[1], quad[3], quad[5], quad[7]];
-      const fontName = typeof font?.getName === "function" ? font.getName() : String(font ?? "");
-      const bold = /bold/i.test(fontName);
-      const color = toRgb(colorArr) ?? [0, 0, 0];
-
-      chars.push({
-        c,
-        x0: Math.min(...xs),
-        y0: Math.min(...ys),
-        x1: Math.max(...xs),
-        y1: Math.max(...ys),
-        size,
-        bold,
-        color,
-      });
-    },
-  });
-
-  const spans: TextSpan[] = [];
-  let current: TextSpan | null = null;
-
-  for (const ch of chars) {
-    if (
-      current &&
-      current.bold === ch.bold &&
-      current.color[0] === ch.color[0] &&
-      current.color[1] === ch.color[1] &&
-      current.color[2] === ch.color[2] &&
-      Math.abs(current.size - ch.size) < 0.2 &&
-      Math.abs((current.y0 + current.y1) / 2 - (ch.y0 + ch.y1) / 2) <= 1.2 &&
-      ch.x0 <= current.x1 + 1.2
-    ) {
-      current.text += ch.c;
-      current.x1 = Math.max(current.x1, ch.x1);
-      current.y0 = Math.min(current.y0, ch.y0);
-      current.y1 = Math.max(current.y1, ch.y1);
-      continue;
-    }
-
-    if (current) spans.push(current);
-    current = {
-      text: ch.c,
-      x0: ch.x0,
-      y0: ch.y0,
-      x1: ch.x1,
-      y1: ch.y1,
-      size: ch.size,
-      bold: ch.bold,
-      color: ch.color,
-    };
-  }
-  if (current) spans.push(current);
-
-  const seen = new Set<string>();
-  return spans.filter((span) => {
-    const key = `${span.text}|${span.x0.toFixed(1)}|${span.y0.toFixed(1)}|${span.x1.toFixed(1)}|${span.y1.toFixed(1)}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
-function mergeSpans(spans: TextSpan[]): TextSpan[] {
-  if (spans.length === 0) return [];
-
-  const ordered = [...spans].sort(
-    (a, b) => (a.y0 + a.y1) / 2 - (b.y0 + b.y1) / 2 || a.x0 - b.x0,
-  );
-  const merged: TextSpan[] = [];
-  let current = ordered[0];
-
-  for (let i = 1; i < ordered.length; i++) {
-    const span = ordered[i];
-    if (
-      span.text === current.text &&
-      Math.abs(span.x0 - current.x0) <= 0.8 &&
-      Math.abs(span.y0 - current.y0) <= 0.8
-    ) {
-      continue;
-    }
-
-    const sameLine = Math.abs((span.y0 + span.y1) / 2 - (current.y0 + current.y1) / 2) <= 1.2;
-    const marker = ATTACH_MARKERS.has(span.text.trim());
-    const canAttach =
-      sameLine && marker && span.x0 <= current.x1 + 2.2 && !TIME_TOKEN_RE.test(span.text);
-
-    if (canAttach) {
-      const space = current.text.endsWith(" ") ? "" : " ";
-      current = {
-        ...current,
-        text: current.text + space + span.text.trim(),
-        y0: Math.min(current.y0, span.y0),
-        x1: Math.max(current.x1, span.x1),
-        y1: Math.max(current.y1, span.y1),
-      };
-    } else {
-      merged.push(current);
-      current = span;
-    }
-  }
-  merged.push(current);
-  return merged;
-}
-
-function extractShapes(mupdf: MupdfModule, page: PDFPage): ShapeRect[] {
-  const pageBounds = page.getBounds();
-  const pageWidth = pageBounds[2] - pageBounds[0];
-  const pageHeight = pageBounds[3] - pageBounds[1];
-  const pageArea = pageWidth * pageHeight;
-  const shapes: ShapeRect[] = [];
-
-  const fillStroke = new mupdf.StrokeState({
-    lineCap: "Butt",
-    lineJoin: "Miter",
-    lineWidth: 0,
-    miterLimit: 10,
-  });
-
-  // DeviceFunctions is not exported from mupdf types; callbacks match runtime shape.
-  const device = new mupdf.Device({
-    fillPath(path: Path, _evenOdd: boolean, ctm: Matrix, _cs: unknown, color: number[]) {
-      const bounds = path.getBounds(fillStroke, ctm);
-      const [x0, y0, x1, y1] = bounds;
-      const fill = toRgb(color);
-      if (!fill) return;
-      const width = x1 - x0;
-      const height = y1 - y0;
-      if (width <= 2 || height <= 2) return;
-      // Pure white fills are invisible on white paper and, in Word, often paint
-      // over the gray table-header / zebra rows because of anchor z-order.
-      const isWhite = fill[0] >= 250 && fill[1] >= 250 && fill[2] >= 250;
-      if (isWhite) return;
-      if (width * height > pageArea * 0.8) return;
-      shapes.push({ x0, y0, x1, y1, fill, behind: true });
-    },
-    strokePath(path: Path, stroke: StrokeState, ctm: Matrix, _cs: unknown, color: number[]) {
-      const bounds = path.getBounds(stroke, ctm);
-      const [x0, y0, x1, y1] = bounds;
-      if (isPointArtifact(x0, y0, x1, y1) || isTimeUnderline(x0, y0, x1, y1)) return;
-
-      const strokeRgb = toRgb(color) ?? [0, 0, 0];
-      const lineWidth = typeof stroke?.getLineWidth === "function" ? stroke.getLineWidth() : 0.75;
-      const width = x1 - x0;
-      const height = y1 - y0;
-
-      if (height <= 1.5 || width <= 1.5) {
-        shapes.push({ x0, y0, x1, y1, fill: strokeRgb, behind: true });
-        return;
-      }
-
-      shapes.push({
-        x0,
-        y0,
-        x1,
-        y1,
-        stroke: strokeRgb,
-        strokeWidth: lineWidth || 0.75,
-        behind: true,
-      });
-    },
-  } as never);
+function extractRows(page: PDFPage): VisualLine[] {
+  const stext = page.toStructuredText("preserve-spans");
+  const spans: Array<RichCell & { y: number }> = [];
+  let current: Glyph[] = [];
 
   try {
-    page.run(device, mupdf.Matrix.identity);
-    // MuPDF warns ("dropping unclosed device") if close() is skipped before GC/destroy.
-    device.close();
+    stext.walk({
+      beginLine() {
+        current = [];
+      },
+      onChar(c, origin, font, size, quad, color) {
+        if (!c || quad.length < 8) return;
+        const xs = [quad[0], quad[2], quad[4], quad[6]];
+        const ys = [quad[1], quad[3], quad[5], quad[7]];
+        const fontName = typeof font?.getName === "function" ? font.getName() : "";
+        current.push({
+          c,
+          x0: Math.min(...xs),
+          x1: Math.max(...xs),
+          y0: Math.min(...ys),
+          baseline: origin[1],
+          size,
+          bold: /bold/i.test(fontName),
+          color: toRgb(color) ?? [0, 0, 0],
+        });
+      },
+      endLine() {
+        const cell = cellFromSpan(current);
+        if (!cell) return;
+        spans.push({ ...cell, y: Math.min(...cell.glyphs.map((glyph) => glyph.y0)) });
+        current = [];
+      },
+    });
   } finally {
-    device.destroy();
-    fillStroke.destroy();
+    stext.destroy?.();
   }
 
-  const unique = new Map<string, ShapeRect>();
-  for (const shape of shapes) {
-    if (isPointArtifact(shape.x0, shape.y0, shape.x1, shape.y1)) continue;
-    if (isTimeUnderline(shape.x0, shape.y0, shape.x1, shape.y1)) continue;
-    const key = [
-      shape.x0.toFixed(1),
-      shape.y0.toFixed(1),
-      shape.x1.toFixed(1),
-      shape.y1.toFixed(1),
-      shape.fill?.join(",") ?? "",
-      shape.stroke?.join(",") ?? "",
-      String(shape.strokeWidth ?? ""),
-    ].join("|");
-    unique.set(key, shape);
-  }
+  const ordered = spans.sort((a, b) => a.y - b.y || a.x0 - b.x0);
+  const rows: Array<{ y: number; cells: RichCell[] }> = [];
 
-  // Larger fills first (lower Word relativeHeight), then strokes/lines on top.
-  return [...unique.values()].sort((a, b) => {
-    const areaA = Math.abs(a.x1 - a.x0) * Math.abs(a.y1 - a.y0);
-    const areaB = Math.abs(b.x1 - b.x0) * Math.abs(b.y1 - b.y0);
-    if (areaA !== areaB) return areaB - areaA;
-    return a.y0 - b.y0 || a.x0 - b.x0;
-  });
-}
-
-function shapeRectXml(shape: ShapeRect, shapeId: number): string {
-  const x = ptEmu(shape.x0);
-  const y = ptEmu(shape.y0);
-  const cx = Math.max(ptEmu(shape.x1 - shape.x0), 635);
-  const cy = Math.max(ptEmu(shape.y1 - shape.y0), 635);
-  const behind = shape.behind ? 1 : 0;
-
-  let fillXml = "<a:noFill/>";
-  let lineXml = "<a:ln><a:noFill/></a:ln>";
-  if (shape.fill) {
-    fillXml = `<a:solidFill><a:srgbClr val="${rgbHex(shape.fill)}"/></a:solidFill>`;
-  } else if (shape.stroke) {
-    lineXml = `<a:ln w="${ptEmu(shape.strokeWidth ?? 0.75)}"><a:solidFill><a:srgbClr val="${rgbHex(shape.stroke)}"/></a:solidFill></a:ln>`;
-  }
-
-  return `<w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${shapeId}" behindDoc="${behind}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>${x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:posOffset>${y}</wp:posOffset></wp:positionV><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/><wp:docPr id="${shapeId}" name="Shape ${shapeId}"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>${fillXml}${lineXml}</wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>`;
-}
-
-function textboxXml(span: TextSpan, shapeId: number): string {
-  const x = ptEmu(span.x0);
-  const y = ptEmu(span.y0);
-  const cx = ptEmu(Math.max(span.x1 - span.x0 + 1.2, span.size * 0.85));
-  const cy = ptEmu(Math.max(span.y1 - span.y0 + 0.9, span.size * 1.25));
-  const text = escapeXml(span.text);
-  const bold = span.bold ? "<w:b/>" : "";
-  const color = rgbHex(span.color);
-  const sizeHalfPoints = Math.max(Math.round(span.size * 2), 12);
-  const relHeight = shapeId + 100000;
-
-  return `<w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${relHeight}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>${x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:posOffset>${y}</wp:posOffset></wp:positionV><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/><wp:docPr id="${shapeId}" name="Text ${shapeId}"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent><w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="0" w:right="0" w:firstLine="0"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="${sizeHalfPoints}"/><w:szCs w:val="${sizeHalfPoints}"/><w:color w:val="${color}"/><w:spacing w:val="0"/>${bold}</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" upright="1"/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>`;
-}
-
-function buildDocumentXml(
-  pages: Array<{ width: number; height: number; drawings: string[] }>,
-): string {
-  const first = pages[0];
-  const pageWidthTwips = Math.round(first.width * 20);
-  const pageHeightTwips = Math.round(first.height * 20);
-
-  const bodyParts: string[] = [];
-  pages.forEach((page, index) => {
-    if (index > 0) {
-      bodyParts.push('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+  for (const span of ordered) {
+    const row = rows.at(-1);
+    if (row && span.y - row.y <= ROW_BAND) {
+      row.cells.push(span);
+      continue;
     }
-    const runs = page.drawings.map((drawing) => `<w:r>${drawing}</w:r>`).join("");
-    bodyParts.push(
-      `<w:p><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>${runs}</w:p>`,
+    rows.push({ y: span.y, cells: [span] });
+  }
+
+  return rows
+    .map((row) => {
+      const cells = row.cells
+        .sort((a, b) => a.x0 - b.x0)
+        .filter((cell, index, all) => {
+          const prev = all[index - 1];
+          if (!prev) return true;
+          return !(Math.abs(cell.x0 - prev.x0) < 0.8 && cellText(cell) === cellText(prev));
+        });
+      return { y: row.y, cells };
+    })
+    .filter((line) => line.cells.length > 0);
+}
+
+function canMerge(run: TextRun, glyph: Glyph): boolean {
+  return (
+    run.bold === glyph.bold &&
+    Math.abs(run.size - glyph.size) < 0.2 &&
+    run.color[0] === glyph.color[0] &&
+    run.color[1] === glyph.color[1] &&
+    run.color[2] === glyph.color[2]
+  );
+}
+
+function cellRuns(cell: RichCell): TextRun[] {
+  const glyphs = [...cell.glyphs];
+  while (glyphs.length > 0 && !glyphs[0].c.trim()) glyphs.shift();
+  while (glyphs.length > 0 && !glyphs.at(-1)!.c.trim()) glyphs.pop();
+
+  const runs: TextRun[] = [];
+  for (const glyph of glyphs) {
+    const text = cleanText(glyph.c);
+    if (!text) continue;
+    const current = runs.at(-1);
+    if (current && canMerge(current, glyph)) {
+      current.text += text;
+      continue;
+    }
+    runs.push({
+      text,
+      size: glyph.size,
+      bold: glyph.bold,
+      color: glyph.color,
+      baseline: glyph.baseline,
+    });
+  }
+  return runs.filter((run) => run.text.length > 0);
+}
+
+function runXml(run: TextRun): string {
+  const size = Math.max(Math.round(run.size * 2), 12);
+  const bold = run.bold ? "<w:b/>" : "";
+  return `<w:r><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/><w:color w:val="${rgbHex(run.color)}"/>${bold}</w:rPr><w:t xml:space="preserve">${escapeXml(run.text)}</w:t></w:r>`;
+}
+
+function runsXml(cells: RichCell[]): string {
+  const parts: string[] = [];
+  for (const cell of cells) {
+    const runs = cellRuns(cell);
+    if (runs.length === 0) continue;
+    if (parts.length > 0) {
+      parts.push(runXml({ ...runs[0], text: " ", bold: false }));
+    }
+    parts.push(runs.map(runXml).join(""));
+  }
+  return parts.join("");
+}
+
+function isGridHeader(line: VisualLine): boolean {
+  const texts = line.cells.map(cellText);
+  return texts.includes("E1") && texts.some((text) => text.startsWith("Per"));
+}
+
+function isFooter(line: VisualLine): boolean {
+  const text = lineText(line);
+  return text.startsWith("Marcações") || text.startsWith("Sistema em Conformidade");
+}
+
+function isDayRow(cells: RichCell[][]): boolean {
+  return /^\d{2}\/\d{2}\/\d{4}/.test(cellText(cells[0]?.[0] ?? { x0: 0, x1: 0, glyphs: [] }));
+}
+
+function columnOf(x: number, xs: number[]): number {
+  let index = 0;
+  for (let i = 0; i < xs.length; i++) {
+    if (x + 3 >= xs[i]) index = i;
+  }
+  return index;
+}
+
+function columnWidths(xs: number[], right: number): number[] {
+  return xs.map((x, index) => Math.max(tw((xs[index + 1] ?? right) - x), 240));
+}
+
+function bucketLine(line: VisualLine, xs: number[]): RichCell[][] {
+  const buckets: RichCell[][] = xs.map(() => []);
+  for (const cell of line.cells) buckets[columnOf(cell.x0, xs)].push(cell);
+  return buckets;
+}
+
+const NIL_BORDERS = `<w:tblBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/><w:insideH w:val="nil"/><w:insideV w:val="nil"/></w:tblBorders>`;
+const BAR_COLOR = "D9D9D9";
+
+type CellEdges = {
+  top?: boolean;
+  bottom?: boolean;
+  right?: boolean;
+  rightColor?: string;
+};
+
+function tableXml(widths: number[], rows: string[], cellMar = 20, indent = 0): string {
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  const grid = widths.map((width) => `<w:gridCol w:w="${width}"/>`).join("");
+  return `<w:tbl><w:tblPr><w:tblW w:w="${total}" w:type="dxa"/><w:jc w:val="left"/><w:tblInd w:w="${indent}" w:type="dxa"/>${NIL_BORDERS}<w:tblLayout w:type="fixed"/><w:tblCellMar><w:top w:w="${cellMar}" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:bottom w:w="${cellMar}" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr><w:tblGrid>${grid}</w:tblGrid>${rows.join("")}</w:tbl>`;
+}
+
+function edgeXml(edge: string, on: boolean, color: string): string {
+  if (!on) return `<w:${edge} w:val="nil"/>`;
+  return `<w:${edge} w:val="single" w:sz="8" w:space="0" w:color="${color}"/>`;
+}
+
+function cellXml(
+  width: number,
+  body: string,
+  fill: string | null,
+  edges: CellEdges | null,
+  noWrap: boolean,
+  span = 1,
+): string {
+  const shade = fill ? `<w:shd w:val="clear" w:color="auto" w:fill="${fill}"/>` : "";
+  const border = edges
+    ? `<w:tcBorders>${edgeXml("top", Boolean(edges.top), "000000")}${edgeXml("left", false, "000000")}${edgeXml("bottom", Boolean(edges.bottom), "000000")}${edgeXml("right", Boolean(edges.right), edges.rightColor ?? BAR_COLOR)}</w:tcBorders>`
+    : "";
+  const wrap = noWrap ? "<w:noWrap/>" : "";
+  const gridSpan = span > 1 ? `<w:gridSpan w:val="${span}"/>` : "";
+  const content = body || `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/></w:pPr></w:p>`;
+  return `<w:tc><w:tcPr><w:tcW w:w="${width}" w:type="dxa"/>${gridSpan}${border}${shade}${wrap}<w:vAlign w:val="center"/></w:tcPr>${content}</w:tc>`;
+}
+
+function cellParagraph(runs: string): string {
+  return `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:ind w:left="0" w:right="0"/></w:pPr>${runs}</w:p>`;
+}
+
+function gridParagraph(runs: string, line: number): string {
+  return `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="${line}" w:lineRule="exact"/><w:ind w:left="0" w:right="0"/></w:pPr>${runs}</w:p>`;
+}
+
+function gridTable(lines: VisualLine[], pageRight: number): string {
+  const xs = lines[0].cells.map((cell) => cell.x0);
+  const widths = columnWidths(xs, pageRight);
+  let day = 0;
+  const headerLine = 320;
+  const bodyLine = 272;
+
+  const rows = lines.map((line, index) => {
+    const buckets = bucketLine(line, xs);
+    const dayRow = index > 0 && isDayRow(buckets);
+    const fill = index === 0 ? BAR_COLOR : dayRow && day % 2 === 0 ? "E3E3E3" : null;
+    if (dayRow) day += 1;
+    const height = index === 0 ? headerLine : bodyLine;
+
+    const cells = buckets.map((bucket, column) =>
+      cellXml(widths[column], gridParagraph(runsXml(bucket), height), fill, null, true),
     );
+    return `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="${height}" w:hRule="exact"/></w:trPr>${cells.join("")}</w:tr>`;
   });
 
-  bodyParts.push(
-    `<w:sectPr><w:pgSz w:w="${pageWidthTwips}" w:h="${pageHeightTwips}"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>`,
+  return tableXml(widths, rows, 0, Math.max(0, tw(xs[0] - PAGE_MARGIN)));
+}
+
+function employeeBuckets(line: VisualLine, xs: number[]): RichCell[][] {
+  if (line.cells.length <= 2) {
+    const buckets: RichCell[][] = xs.map(() => []);
+    line.cells.forEach((cell, index) => {
+      if (buckets[index]) buckets[index].push(cell);
+    });
+    return buckets;
+  }
+  return bucketLine(line, xs);
+}
+
+function employeeTable(lines: VisualLine[], pageRight: number): string {
+  const model = lines.reduce((best, line) => (line.cells.length > best.cells.length ? line : best));
+  const xs = model.cells.map((cell) => cell.x0);
+  const widths = columnWidths(xs, pageRight);
+
+  const rows = lines.map((line) => {
+    const buckets = employeeBuckets(line, xs);
+    const cells = buckets.map((bucket, column) =>
+      cellXml(widths[column], cellParagraph(runsXml(bucket)), null, null, false),
+    );
+    return `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="260" w:hRule="exact"/></w:trPr>${cells.join("")}</w:tr>`;
+  });
+
+  return tableXml(widths, rows, 0);
+}
+
+function contentWidths(contentRight: number): number[] {
+  const total = tw(contentRight - PAGE_MARGIN);
+  const left = tw(TICK_X - PAGE_MARGIN);
+  const right = tw(Math.max(90, contentRight - RIGHT_COL_X));
+  return [left, Math.max(total - left - right, 400), right];
+}
+
+function bannerParagraph(runs: string, align: "left" | "right", indent: number, rightTab = 0): string {
+  const tabs =
+    align === "right" && rightTab > 0
+      ? `<w:tabs><w:tab w:val="right" w:pos="${rightTab}"/></w:tabs>`
+      : "";
+  const ind = indent > 0 ? `<w:ind w:left="${indent}"/>` : "";
+  const lead = align === "right" ? "<w:r><w:tab/></w:r>" : "";
+  return `<w:p><w:pPr>${tabs}<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/>${ind}<w:rPr><w:sz w:val="2"/></w:rPr></w:pPr>${lead}${runs}</w:p>`;
+}
+
+function bannerSlots(rows: VisualLine[]): Array<[RichCell[], RichCell[], RichCell[]]> {
+  if (rows.length === 0) return [];
+  const cut = rows[0].y + 8;
+  const bands = [rows.filter((row) => row.y < cut), rows.filter((row) => row.y >= cut)].filter(
+    (band) => band.length > 0,
   );
 
+  return bands.map((band) => {
+    const slots: [RichCell[], RichCell[], RichCell[]] = [[], [], []];
+    for (const row of band) {
+      for (const cell of row.cells) {
+        const slot = cell.x0 >= RIGHT_COL_X - 30 ? 2 : cell.x0 >= TICK_X - 10 ? 1 : 0;
+        slots[slot].push(cell);
+      }
+    }
+    return slots;
+  });
+}
+
+function bannerTable(rows: VisualLine[], contentRight: number): string {
+  const widths = contentWidths(contentRight);
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  const bands = bannerSlots(rows);
+  const title = bands[0] ?? [[], [], []];
+  const subtitle = bands[1] ?? [[], [], []];
+
+  const textRow = (slots: [RichCell[], RichCell[], RichCell[]], height: number, tick: boolean) => {
+    const cells = slots.map((slot, index) => {
+      const indent = index === 1 && slot[0] ? Math.max(0, tw(slot[0].x0 - TICK_X)) : 0;
+      const align = index === 2 ? "right" : "left";
+      return cellXml(
+        widths[index],
+        bannerParagraph(runsXml(slot), align, indent, widths[index]),
+        null,
+        tick ? { right: index === 0 } : null,
+        true,
+      );
+    });
+    return `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="${tw(height)}" w:hRule="exact"/></w:trPr>${cells.join("")}</w:tr>`;
+  };
+
+  const bar = `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="${tw(BAR_ROW)}" w:hRule="exact"/></w:trPr>${cellXml(total, "", BAR_COLOR, null, true, 3)}</w:tr>`;
+  return tableXml(widths, [textRow(title, TITLE_ROW, true), textRow(subtitle, SUB_ROW, true), bar], 0);
+}
+
+function companyBuckets(line: VisualLine): RichCell[][] {
+  const buckets: RichCell[][] = [[], [], [], []];
+  for (const cell of line.cells) {
+    const index = cell.x0 >= 250 ? 3 : cell.x0 >= 200 ? 2 : cell.x0 >= 70 ? 1 : 0;
+    buckets[index].push(cell);
+  }
+  return buckets;
+}
+
+function companyTable(lines: VisualLine[], contentRight: number): string {
+  const total = tw(contentRight - PAGE_MARGIN);
+  const widths = [tw(53), tw(151), tw(29), total - tw(53) - tw(151) - tw(29)];
+  const rows = lines.map((line, index) => {
+    const last = index === lines.length - 1;
+    const cells = companyBuckets(line).map((bucket, column) =>
+      cellXml(widths[column], cellParagraph(runsXml(bucket)), null, last ? { bottom: true } : null, true),
+    );
+    return `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="260" w:hRule="exact"/></w:trPr>${cells.join("")}</w:tr>`;
+  });
+  return tableXml(widths, rows, 0);
+}
+
+function spacer(twips: number): string {
+  return `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="${twips}" w:lineRule="exact"/><w:rPr><w:sz w:val="2"/></w:rPr></w:pPr></w:p>`;
+}
+
+function introParagraph(line: VisualLine, pageBreak: boolean, after = 0): string {
+  const [first, ...rest] = line.cells;
+  const tabs: number[] = [];
+  const parts = [runsXml([first])];
+  let previous = first;
+
+  for (const cell of rest) {
+    const pos = tw(cell.x0 - PAGE_MARGIN);
+    const indent = tw(Math.max(0, first.x0 - PAGE_MARGIN));
+    if (cell.x0 - previous.x1 >= 2 && pos > (tabs.at(-1) ?? indent)) {
+      tabs.push(pos);
+      parts.push("<w:r><w:tab/></w:r>");
+      parts.push(runsXml([cell]));
+    } else {
+      parts.push(runsXml([cell]));
+    }
+    previous = cell;
+  }
+
+  const tabXml =
+    tabs.length > 0
+      ? `<w:tabs>${tabs.map((pos) => `<w:tab w:val="left" w:pos="${pos}"/>`).join("")}</w:tabs>`
+      : "";
+  const breakXml = pageBreak ? "<w:pageBreakBefore/>" : "";
+  const indent = tw(Math.max(0, first.x0 - PAGE_MARGIN));
+
+  return `<w:p><w:pPr>${breakXml}<w:spacing w:before="60" w:after="${after}" w:line="240" w:lineRule="auto"/><w:ind w:left="${indent}" w:right="0"/>${tabXml}</w:pPr>${parts.join("")}</w:p>`;
+}
+
+function isSignatureLine(line: VisualLine): boolean {
+  return line.cells.some((cell) => cell.x0 >= SIGN_X - 20);
+}
+
+function tightParagraph(runs: string, align: "left" | "center"): string {
+  const jc = align === "center" ? `<w:jc w:val="center"/>` : "";
+  return `<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="160" w:lineRule="exact"/>${jc}</w:pPr>${runs}</w:p>`;
+}
+
+function signatureBlock(note: VisualLine | null, line: VisualLine, contentRight: number): string {
+  const right = tw(SIGN_WIDTH);
+  const left = Math.max(tw(contentRight - PAGE_MARGIN) - right, tw(200));
+  const notes = line.cells.filter((cell) => cell.x0 < SIGN_X - 20);
+  const name = line.cells.filter((cell) => cell.x0 >= SIGN_X - 20);
+  const row = (height: number, leftRuns: string, rightRuns: string, align: "left" | "center", lineOnRight: boolean) =>
+    `<w:tr><w:trPr><w:cantSplit/><w:trHeight w:val="${height}" w:hRule="exact"/></w:trPr>${cellXml(left, tightParagraph(leftRuns, "left"), null, null, true)}${cellXml(right, tightParagraph(rightRuns, align), null, lineOnRight ? { top: true } : null, true)}</w:tr>`;
+  const rows = [
+    note ? row(200, runsXml(note.cells), "", "left", true) : "",
+    row(200, runsXml(notes), runsXml(name), "center", note == null),
+  ].filter(Boolean);
+  return tableXml([left, right], rows, 0);
+}
+
+function footerXml(lines: VisualLine[], contentRight: number): string {
+  const signAt = lines.findIndex(isSignatureLine);
+  if (signAt < 0) return lines.map((line) => introParagraph(line, false)).join("");
+
+  const head = lines.slice(0, signAt > 0 ? signAt - 1 : 0);
+  const note = signAt > 0 ? lines[signAt - 1] : null;
+  return [
+    head.map((line) => introParagraph(line, false, 48)).join(""),
+    signatureBlock(note, lines[signAt], contentRight),
+    lines
+      .slice(signAt + 1)
+      .map((line) => introParagraph(line, false))
+      .join(""),
+  ].join("");
+}
+
+type PageOut = {
+  width: number;
+  height: number;
+  body: string;
+  header: string | null;
+};
+
+function startsWithLabel(line: VisualLine, label: string): boolean {
+  return line.cells.some((cell) => cellText(cell).startsWith(label));
+}
+
+function pageParts(lines: VisualLine[], contentRight: number): { body: string; header: string | null } {
+  const gridAt = lines.findIndex(isGridHeader);
+  if (gridAt < 0) {
+    return { header: null, body: lines.map((line) => introParagraph(line, false)).join("") };
+  }
+
+  const footerAt = lines.findIndex((line, index) => index > gridAt && isFooter(line));
+  const gridEnd = footerAt === -1 ? lines.length : footerAt;
+  const employeeAt = lines.findIndex((line, index) => index < gridAt && startsWithLabel(line, "Funcionário"));
+  const introEnd = employeeAt === -1 ? gridAt : employeeAt;
+  const intro = regroup(lines.slice(0, introEnd), 2);
+  const empresaAt = intro.findIndex((line) => startsWithLabel(line, "Empresa"));
+  const employee = employeeAt === -1 ? [] : lines.slice(employeeAt, gridAt);
+  const grid = lines.slice(gridAt, gridEnd);
+  const footer = lines.slice(gridEnd);
+
+  const header = empresaAt > 0 ? bannerTable(intro.slice(0, empresaAt), contentRight) : null;
+  const company = empresaAt >= 0 ? intro.slice(empresaAt) : intro;
+
+  const parts: string[] = [];
+  if (!header && company.length > 0) {
+    parts.push(company.map((line) => introParagraph(line, false)).join(""));
+  } else if (company.length > 0) {
+    parts.push(spacer(120));
+    parts.push(companyTable(company, contentRight));
+    parts.push(spacer(160));
+  }
+  if (employee.length > 0) parts.push(employeeTable(employee, contentRight));
+  parts.push(spacer(40));
+  parts.push(gridTable(grid, contentRight));
+  if (footer.length > 0) {
+    parts.push(spacer(200));
+    parts.push(footerXml(footer, contentRight));
+  }
+  return { header, body: parts.join("") };
+}
+
+function sectionXml(page: PageOut, headerId: string | null): string {
+  const header = headerId ? `<w:headerReference w:type="default" r:id="${headerId}"/>` : "";
+  const top = headerId ? BODY_TOP : 36;
+  const headerDistance = headerId ? PAGE_TOP : 0;
+  return `<w:sectPr>${header}<w:type w:val="nextPage"/><w:pgSz w:w="${tw(page.width)}" w:h="${tw(page.height)}"/><w:pgMar w:top="${tw(top)}" w:right="${tw(PAGE_RIGHT)}" w:bottom="${tw(36)}" w:left="${tw(PAGE_MARGIN)}" w:header="${tw(headerDistance)}" w:footer="0" w:gutter="0"/></w:sectPr>`;
+}
+
+function buildDocumentXml(pages: PageOut[]): string {
+  const chunks = pages.map((page, index) => {
+    const headerId = page.header ? `rIdH${index + 1}` : null;
+    const section = sectionXml(page, headerId);
+    if (index === pages.length - 1) return `${page.body || "<w:p/>"}${section}`;
+    return `${page.body || "<w:p/>"}<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="1" w:lineRule="exact"/><w:rPr><w:sz w:val="2"/></w:rPr>${section}</w:pPr></w:p>`;
+  });
+
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <w:body>
-    ${bodyParts.join("\n")}
+    ${chunks.join("")}
   </w:body>
 </w:document>`;
 }
 
-async function packDocx(documentXml: string): Promise<Uint8Array> {
+function headerXml(body: string): string {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${body}</w:hdr>`;
+}
+
+async function packDocx(pages: PageOut[]): Promise<Uint8Array> {
   const zip = new JSZip();
+  const headerOverrides = pages
+    .map((page, index) =>
+      page.header
+        ? `<Override PartName="/word/header${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/>`
+        : "",
+    )
+    .join("");
   zip.file(
     "[Content_Types].xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -362,6 +635,7 @@ async function packDocx(documentXml: string): Promise<Uint8Array> {
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+  ${headerOverrides}
 </Types>`,
   );
   zip.folder("_rels")?.file(
@@ -372,21 +646,46 @@ async function packDocx(documentXml: string): Promise<Uint8Array> {
 </Relationships>`,
   );
   const word = zip.folder("word");
-  word?.file("document.xml", documentXml);
+  word?.file("document.xml", buildDocumentXml(pages));
   word?.file(
     "styles.xml",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault>
+      <w:rPr>
+        <w:rFonts w:ascii="Arial" w:hAnsi="Arial" w:cs="Arial"/>
+        <w:sz w:val="16"/>
+        <w:szCs w:val="16"/>
+      </w:rPr>
+    </w:rPrDefault>
+    <w:pPrDefault>
+      <w:pPr>
+        <w:spacing w:before="0" w:after="0"/>
+      </w:pPr>
+    </w:pPrDefault>
+  </w:docDefaults>
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
     <w:name w:val="Normal"/>
     <w:qFormat/>
   </w:style>
 </w:styles>`,
   );
+
+  const headerRels = pages
+    .map((page, index) =>
+      page.header
+        ? `<Relationship Id="rIdH${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header${index + 1}.xml"/>`
+        : "",
+    )
+    .join("");
+  pages.forEach((page, index) => {
+    if (page.header) word?.file(`header${index + 1}.xml`, headerXml(page.header));
+  });
   word?.folder("_rels")?.file(
     "document.xml.rels",
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`,
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${headerRels}</Relationships>`,
   );
 
   return zip.generateAsync({ type: "uint8array" });
@@ -399,31 +698,35 @@ export async function convertPdfToDocx(pdfBytes: ArrayBuffer | Uint8Array): Prom
 
   try {
     const pageCount = doc.countPages();
-    if (pageCount === 0) {
-      throw new Error("O PDF não contém páginas.");
-    }
+    if (pageCount === 0) throw new Error("O PDF não contém páginas.");
 
-    let shapeId = 1;
-    const pages: Array<{ width: number; height: number; drawings: string[] }> = [];
+    const pages: PageOut[] = [];
+    let textLines = 0;
 
     for (let i = 0; i < pageCount; i++) {
-      const page = doc.loadPage(i) as PDFPage;
-      const bounds = page.getBounds();
-      const width = bounds[2] - bounds[0];
-      const height = bounds[3] - bounds[1];
-      const drawings: string[] = [];
-
-      for (const shape of extractShapes(mupdf, page)) {
-        drawings.push(shapeRectXml(shape, shapeId++));
+      const page = doc.loadPage(i);
+      try {
+        const bounds = page.getBounds();
+        const width = bounds[2] - bounds[0];
+        const lines = extractRows(page as PDFPage);
+        textLines += lines.length;
+        const parts = pageParts(lines, width - PAGE_RIGHT);
+        pages.push({
+          width,
+          height: bounds[3] - bounds[1],
+          body: parts.body,
+          header: parts.header,
+        });
+      } finally {
+        page.destroy?.();
       }
-      for (const span of mergeSpans(extractSpans(page))) {
-        drawings.push(textboxXml(span, shapeId++));
-      }
-
-      pages.push({ width, height, drawings });
     }
 
-    return packDocx(buildDocumentXml(pages));
+    if (textLines === 0) {
+      throw new Error("Não encontrei texto neste PDF. Arquivos só com imagem não viram texto editável.");
+    }
+
+    return packDocx(pages);
   } finally {
     doc.destroy?.();
   }
