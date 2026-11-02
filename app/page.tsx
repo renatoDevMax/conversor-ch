@@ -112,8 +112,6 @@ export default function Home() {
 
   return (
     <div className="home-shell relative flex flex-1 flex-col overflow-x-clip">
-      <div className="home-grid" aria-hidden />
-
       <main
         className={`relative z-10 mx-auto flex w-full flex-1 flex-col items-center px-6 py-16 text-center ${status === "ready" ? "max-w-5xl justify-start" : "max-w-3xl justify-center"}`}
       >
