@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Conversor de PDF RM",
+  title: "Conversor de PDF",
   description: "Converta PDF em Word com a tabela do espelho de ponto",
 };
 

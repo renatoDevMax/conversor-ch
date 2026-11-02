@@ -115,14 +115,7 @@ export default function Home() {
       <main
         className={`relative z-10 mx-auto flex w-full flex-1 flex-col items-center px-6 py-16 text-center ${status === "ready" ? "max-w-5xl justify-start" : "max-w-3xl justify-center"}`}
       >
-        <p className="home-brand">Conversor de PDF RM</p>
-        <h1 className="home-title mt-4">
-          Converta seu PDF em
-          <span className="home-title-accent"> Word editável</span>
-        </h1>
-        <p className="home-subtitle mt-4 max-w-lg">
-          Selecione o PDF e veja o Word na tela, pronto para baixar.
-        </p>
+        <h1 className="home-title">Conversor de PDF</h1>
 
         <input
           ref={inputRef}
@@ -147,7 +140,7 @@ export default function Home() {
         )}
 
         {status !== "loading" && (
-          <div className="mt-12 flex w-full flex-col items-center gap-4">
+          <div className="mt-6 flex w-full flex-col items-center gap-4">
             {status === "ready" && downloadUrl && fileName && docxBytes ? (
               <>
                 <p className="home-ready-label">Documento na tela</p>
